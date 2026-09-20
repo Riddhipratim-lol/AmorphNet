@@ -1,0 +1,1 @@
+"""AmorphNet package root."""

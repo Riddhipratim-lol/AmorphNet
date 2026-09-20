@@ -93,7 +93,7 @@ All three sub-systems are orchestrated by LangGraph and exposed via FastAPI.
 | Layer | Technology | Version / Driver / Model | Role |
 |---|---|---|---|
 | Document Parsing | LlamaParse Cloud API | `llama-cloud-services >=0.6.94` (API v2) | Structure-aware PDF parsing with multimodal output |
-| Embeddings | `voyage-finance-2` | `voyageai >=0.5.0` via Voyage AI API (cloud) | Finance-domain dense embeddings (1024 dim) |
+| Embeddings | `voyage-4-large` | `voyageai >=0.5.0` via Voyage AI API (cloud) | Flagship MoE dense embeddings (1024 dim default, 32k context) |
 | Sparse Vectorizer | BM25 (Qdrant Cloud native inference) | Qdrant Cloud v1.14+ | Keyword-based sparse vectors — generated server-side on Qdrant Cloud |
 | Vector Store | **Qdrant Cloud** | `qdrant-client >=1.19.0` (managed cloud API) | Dense + sparse named vectors, hybrid Query API |
 | Graph Store | **Neo4j AuraDB** | `neo4j >=6.3.0` / AuraDB v5.26+ (managed cloud API) | Document/section/entity relationship graph |
@@ -101,12 +101,13 @@ All three sub-systems are orchestrated by LangGraph and exposed via FastAPI.
 | Re-ranking | `rerank-2.5` | `voyageai >=0.5.0` via Voyage AI API (cloud) | Cross-encoder precision re-ranking — 32k context with instruction-following |
 | Orchestration | LangChain + LangGraph | `langchain >=1.4.0`, `langgraph >=1.2.11` | Pipeline DAG + stateful agent workflows |
 | Generation | `gemini-3.5-flash-lite` | `google-genai >=2.23.0` via Google GenAI API (cloud) | Citation-grounded answer generation |
-| Evaluation | RAGAS | `ragas >=0.4.3` | Automated RAG quality metrics |
-| API & Schema | FastAPI + Pydantic | `fastapi >=0.141.1`, `pydantic >=2.13.5` | REST API serving query and ingestion endpoints + schemas |
+| Evaluation | RAGAS + Gemini 3.5 Flash-Lite | `ragas >=0.4.3`, `langchain-google-genai` | Automated RAG quality metrics evaluated via Gemini 3.5 Flash-Lite |
+| API & Schema | FastAPI + Pydantic + SlowAPI | `fastapi >=0.141.1`, `pydantic >=2.13.5`, `slowapi >=0.1.9` | REST API with Redis-backed endpoint rate limiting + schemas |
+| Rate Limiting & Throttling | `aiolimiter` + `tenacity` | `aiolimiter >=1.2.1`, `tenacity >=9.0.0` | Client-side token-bucket rate limiters and exponential backoff retry wrappers |
 | Async Runtime | asyncio + uvicorn | `uvicorn >=0.52.4`, Python 3.12+ | Fully async pipeline execution |
-| Caching | **Upstash Redis** (Serverless) | `upstash-redis >=1.8.0` / `redis >=8.1.0` | Cloud-hosted serverless Redis — query cache + ingestion job state |
+| Caching | **Upstash Redis** (Serverless) | `upstash-redis >=1.8.0` / `redis >=8.1.0` | Cloud-hosted serverless Redis — query cache + rate limiter backend + task state |
 
-> **Note on `voyage-finance-2` vs `voyage-4-large`**: Voyage AI's latest general-purpose series is `voyage-4-large` (32k context, 1024 dim). However, `voyage-finance-2` remains the recommended choice for **financial domain retrieval** because it was fine-tuned on financial corpora and produces superior in-domain recall on SEC filings, earnings reports, and accounting text. Use `voyage-finance-2` for all chunk and query embeddings in this project.
+> **Note on `voyage-4-large` vs legacy `voyage-finance-2`**: Voyage AI's latest flagship model is `voyage-4-large` (32k context, 1024 dim default). According to Voyage AI's benchmark evaluations (Retrieval Embedding Benchmark - RTEB) and official documentation, the Series 4 generation is "strictly better than legacy models in all aspects, such as quality, context length, latency, and throughput", outperforming previous domain-specific models including `voyage-finance-2` across financial filings and complex multi-page retrieval. It introduces a state-of-the-art Mixture-of-Experts (MoE) architecture (75% fewer active parameters, 40% lower serving costs) and features a shared embedding space. Use `voyage-4-large` for all chunk and query dense embeddings in this project.
 
 > **Note on `rerank-2.5` vs older `rerank-2`**: `rerank-2.5` is Voyage AI's current recommended reranker (as of 2025–2026), succeeding `rerank-2`. It adds instruction-following support and multilingual capability at a 32k context window, versus `rerank-2`'s 16k. Use `rerank-2.5` for all re-ranking steps.
 
@@ -141,13 +142,16 @@ status          enum ("pending", "parsing", "indexed", "failed")
 
 Before parsing, compute a **SHA-256 hash** of the raw PDF bytes. If the hash already exists in the Document Registry, skip re-ingestion. This prevents re-parsing the same annual report twice and avoids creating duplicate vectors in Qdrant.
 
-### 4.3 Pre-Processing Checks
+### 4.3 Pre-Processing Checks & Rate-Limit Guardrails
 
 Before sending to LlamaParse:
 - Validate the PDF is not password-protected
 - Detect if the PDF is a scanned image-only document (using PyMuPDF's `page.get_images()`) — flag this as `scan_mode=True` so LlamaParse uses its OCR mode
 - Extract basic document metadata (title, author, creation date) from PDF XMP metadata using PyMuPDF
-- Count total pages; documents over 600 pages are split into 200-page batches for parallel async parsing
+- **Page Cap & Splitting**: LlamaParse enforces a hard ceiling of 500 pages per extraction job. Documents over 500 pages are split into batches of <= 200 pages.
+- **Concurrency Throttling**: LlamaParse Free/Starter tier enforces a 5-job concurrency limit (and 20 RPM upload window). Batch jobs are bounded by an `asyncio.Semaphore(3)` to ensure concurrent page extraction tasks never exceed provider concurrency ceilings.
+- **Cache Reuse**: Keep `invalidate_cache: false` enabled in parsing config; LlamaParse provides a 48-hour result cache preventing re-billing and quota consumption on identical files.
+- **Retry Backoff**: Wrap job submission and status polling with `tenacity` retry using exponential backoff (initial wait 2s, max 30s) on HTTP `429 Too Many Requests`.
 
 ---
 
@@ -213,11 +217,11 @@ After parsing, each page's markdown is split by element type detected in Phase 1
 Narrative prose (MD&A, Risk Factors, Business Overview) is chunked using a **hierarchical splitter**:
 
 - **Primary split**: Section headers (detected via markdown `##` and `###` headers from LlamaParse output)
-- **Secondary split**: Semantic sentence-boundary splitting within sections, targeting `512 tokens` per chunk (using the voyage-finance-2 tokenizer for accurate token counting)
+- **Secondary split**: Semantic sentence-boundary splitting within sections, targeting `512 tokens` per chunk (using Voyage's tokenizer via the `voyageai` SDK for accurate token counting)
 - **Overlap**: `50 token` sliding window overlap between consecutive text chunks within the same section — this preserves context across sentence boundaries
 - **Maximum chunk size**: `768 tokens` (hard cap; anything larger will miss nuance during retrieval)
 
-Rationale for 512 tokens: `voyage-finance-2` has a 32k context window but embedding quality degrades at very large chunk sizes. 512 tokens is empirically optimal for dense retrieval on financial text.
+Rationale for 512 tokens: `voyage-4-large` supports a 32k context window, but embedding quality for granular numeric and footnote retrieval degrades at massive chunk sizes. 512 tokens is empirically optimal for dense retrieval on dense financial text.
 
 #### 6.1.2 Table Chunks
 
@@ -302,7 +306,7 @@ These extracted fields are stored as structured metadata payload attributes and 
 
 The pipeline employs **Query-Side HyDE** (in [Section 9.2](#92-query-expansion)) rather than index-time question pre-computation:
 - **Zero Ingestion Overhead**: No hypothetical questions are generated or embedded during ingestion, saving hundreds of LLM calls and eliminating secondary named vector storage (`hyp_question`) in Qdrant.
-- **Canonical Formulation**: At query time, Gemini generates a single hypothetical financial passage that is embedded with `voyage-finance-2` and searched directly against the primary `dense` chunk vector. This achieves identical vocabulary-bridging recall without bloat.
+- **Canonical Formulation**: At query time, Gemini generates a single hypothetical financial passage that is embedded with `voyage-4-large` and searched directly against the primary `dense` chunk vector. This achieves identical vocabulary-bridging recall without bloat.
 
 ### 7.3 Section Hierarchy Extraction
 
@@ -326,7 +330,7 @@ from qdrant_client import models
 
 vectors_config = {
     "dense": models.VectorParams(
-        size=1024,                  # voyage-finance-2 output dim
+        size=1024,                  # voyage-4-large default output dim
         distance=models.Distance.COSINE,
         hnsw_config=models.HnswConfigDiff(m=16, ef_construct=200)
     )
@@ -362,9 +366,17 @@ payload_indexes = [
 ]
 ```
 
-#### 8.1.4 Ingestion Batch Size
+#### 8.1.4 Embedding Batching & Ingestion Rate Limits
 
-Upload chunks to Qdrant in batches of **100 points** using the async Python client. For large documents (600+ pages), run parallel batch uploads using `asyncio.gather()` with a concurrency limit of 5 batch uploads at a time.
+1. **Voyage AI Dense Embedding (`voyage-4-large`)**:
+   - **Batching**: Voyage AI's embedding API supports up to 128 documents per API call. Chunks are dispatched in batches of **<= 128 chunks** with `input_type="document"`.
+   - **Client Retries**: Initialize the async client with built-in retry backoff: `voyageai.AsyncClient(max_retries=5, timeout=60)`.
+   - **Rate Limiter**: Throttle embedding calls using `aiolimiter.AsyncLimiter(max_rate=50, time_period=60)` to safely stay within Voyage's TPM/RPM thresholds (Standard Tier: 2,000 RPM / 8M TPM; Free Trial: 3 RPM).
+   - **Offline Batch Alternative**: For initial bulk backfills (>5,000 chunks), use Voyage's asynchronous **Batch API** (supports 100,000 inputs per batch, 33% cost reduction, eliminates synchronous rate limit errors).
+
+2. **Qdrant Upsert**:
+   - Upload chunks with payload and vectors in batches of **100 points** using `qdrant_client.upload_points()`.
+   - For multi-batch uploads, limit concurrency using `asyncio.Semaphore(5)` to avoid socket saturation on Qdrant Cloud.
 
 ### 8.2 Neo4j — Document Knowledge Graph
 
@@ -448,9 +460,9 @@ Classification is done using a Gemini 3.5 Flash-Lite call with structured output
 ### 9.2 Query Expansion & Query-Side HyDE
 
 For the query, generate **three representations**:
-1. **Original query** (verbatim): Embedded with `voyage-finance-2` as `dense_query_vector`.
+1. **Original query** (verbatim): Embedded with `voyage-4-large` as `dense_query_vector`.
 2. **Keyword-optimized variant** (for BM25): e.g., `"net revenue total sales FY2024 fiscal year 2024"`, converted to a sparse vector for Qdrant's BM25 index.
-3. **Hypothetical answer fragment** (Query-Side HyDE): e.g., `"Apple's net revenue for fiscal year 2024 was $XXX billion, representing a Y% increase..."`, embedded with `voyage-finance-2` as `hyde_query_vector`.
+3. **Hypothetical answer fragment** (Query-Side HyDE): e.g., `"Apple's net revenue for fiscal year 2024 was $XXX billion, representing a Y% increase..."`, embedded with `voyage-4-large` as `hyde_query_vector`.
 
 Both the original query and the hypothetical answer are embedded into the same 1024-dimensional space and matched against Qdrant's primary `"dense"` vector field.
 
@@ -545,13 +557,20 @@ RRF fuses rank positions from multiple retrieval signals but it does not perform
 ### 12.2 Voyage rerank-2.5 Configuration
 
 ```python
-rerank_result = voyage_client.rerank(
+import voyageai
+
+# Initialize Voyage async client with automatic retry backoff on 429
+voyage_client = voyageai.AsyncClient(max_retries=5, timeout=30.0)
+
+# Candidate pool is 30 chunks, easily within Voyage's 2,000 RPM / 2M TPM rerank limits
+rerank_result = await voyage_client.rerank(
     query=original_user_query,
     documents=[chunk.text for chunk in candidate_pool],
     model="rerank-2.5",   # Current recommended model; 32k context window
     top_k=6
 )
 ```
+
 
 **Why `rerank-2.5` over `rerank-2`?** `rerank-2.5` is Voyage AI's current production-recommended reranker. It doubles the context window from 16k to 32k tokens (critical for long financial tables), adds instruction-following capability, and maintains multilingual support — all at the same API price point.
 
@@ -636,26 +655,42 @@ class QueryState(TypedDict):
 
 ### 14.2 Generation Call
 
-AmorphNet uses Google's modern `google-genai` SDK (`google-genai >=2.23.0`):
-
 ```python
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from aiolimiter import AsyncLimiter
 
+# Shared backend limiter to respect Gemini RPM ceilings across concurrent users
+# (14 RPM for Free Tier; increase to 500-1000 RPM for Pay-As-You-Go Tier 1+)
+gemini_limiter = AsyncLimiter(max_rate=14, time_period=60)
 client = genai.Client()
 
-response = client.models.generate_content(
-    model="gemini-3.5-flash-lite",   # Current recommended Flash-Lite model
-    contents=f"Context:\n{context_string}\n\nQuestion: {original_query}",
-    config=types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        temperature=0.1,
-        max_output_tokens=1024,
-        response_mime_type="application/json",
-        response_schema=AnswerSchema,
-    ),
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    retry=retry_if_exception_type(APIError),
+    reraise=True
 )
+async def generate_cited_answer(context_string: str, original_query: str) -> AnswerSchema:
+    async with gemini_limiter:
+        response = await client.aio.models.generate_content(
+            model="gemini-3.5-flash-lite",   # Current recommended Flash-Lite model
+            contents=f"Context:\n{context_string}\n\nQuestion: {original_query}",
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0.1,
+                max_output_tokens=1024,
+                response_mime_type="application/json",
+                response_schema=AnswerSchema,
+            ),
+        )
+        return AnswerSchema.model_validate_json(response.text)
 ```
+
+> **Rate Limit Note (Query Pipeline)**: Each end-to-end query executes two Gemini calls (Phase 5 `QueryAnalysis` + Phase 10 `generate_cited_answer`). Both calls route through `gemini_limiter`. On Google AI Studio's Free Tier (15 RPM), this caps backend query throughput to ~7 queries/minute. For production multi-tenant deployments, link a Google Cloud billing account (Pay-As-You-Go Tier 1), lifting the ceiling to 1,000+ RPM with no 500 RPD cliff.
+
 
 **Structured output schema** (`AnswerSchema`):
 
@@ -690,12 +725,16 @@ This validation is a lightweight string-matching step, not an LLM call.
 
 ## 15. Phase 11 — Evaluation (RAGAS)
 
-### 15.1 Evaluation Dataset Construction
+### 15.1 Evaluation Dataset Construction & Quota Management
 
-Build a **golden QA dataset** of 200 questions by:
-1. Manually curating 50 questions from 5-6 representative annual reports (10 questions per document)
-2. Generating 150 additional synthetic questions using Gemini 3.5 Pro (`gemini-3.5-pro`) over the parsed documents
-3. Distributing across query types: 30% `factual_numeric`, 25% `trend_comparative`, 25% `semantic_risk`, 20% `cross_reference`
+Build a **golden QA dataset** of 100 curated questions by:
+1. Manually curating 100 questions from 5–6 representative annual reports (~15–20 questions per filing) with verified ground truth answers and exact source chunk IDs (`reference_chunks`). Eliminating synthetic LLM generation ensures zero question hallucination, high analytical complexity (multi-table lookups, footnote reconciliation), and a reliable benchmark.
+2. Distributing across query types: 30% `factual_numeric`, 25% `trend_comparative`, 25% `semantic_risk`, 20% `cross_reference`.
+
+> [!WARNING]
+> **Daily Quota (RPD) Guardrail**: Evaluating 100 questions across 5 LLM metrics triggers **~500 LLM calls**, which exhausts 100% of Google AI Studio's Free Tier quota (500 RPD). To safeguard daily quotas, evaluation supports two modes:
+> - **`smoke_eval` (Development / Free Tier)**: Evaluates a 10-question stratified subset (~50 LLM calls, consuming only 10% of daily quota).
+> - **`full_eval` (Benchmark / Production CI)**: Evaluates all 100 questions. Requires a Google AI Studio **Pay-As-You-Go account (Tier 1+)**, where the 500 RPD ceiling is lifted and RPM scales to 1,000+.
 
 Each QA pair has:
 ```python
@@ -718,11 +757,19 @@ Each QA pair has:
 
 `Faithfulness >= 0.90` is the primary hard target. For financial data, hallucination is a showstopper metric.
 
-### 15.3 Evaluation Pipeline Invocation
+### 15.3 Evaluation Pipeline Invocation & Rate Limiting
 
-Modern RAGAS (v0.4.3) uses class-based metric instances:
+Modern RAGAS (v0.4.3+) uses class-based metric instances. When evaluating with Gemini models under the 15 RPM limit (e.g., standard/free tier), unthrottled concurrent evaluation triggers `429 RESOURCE_EXHAUSTED`.
+
+To strictly respect the 15 RPM ceiling while evaluating with **Gemini 3.5 Flash-Lite** (`gemini-3.5-flash-lite`), attach LangChain's native `InMemoryRateLimiter` to the `ChatGoogleGenAI` instance and configure Ragas with sequential execution (`RunConfig(max_workers=1)`):
 
 ```python
+from langchain_core.rate_limiters import InMemoryRateLimiter
+from langchain_google_genai import ChatGoogleGenAI
+from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from langchain_voyageai import VoyageAIEmbeddings
+from ragas.run_config import RunConfig
 from ragas import evaluate
 from ragas.metrics import (
     LLMContextPrecisionWithReference,
@@ -730,6 +777,35 @@ from ragas.metrics import (
     Faithfulness,
     ResponseRelevancy,
     AnswerCorrectness,
+)
+
+# 1. Rate limiter: 12 requests/minute (1 request every 5s) to safely stay below the 15 RPM ceiling
+rate_limiter = InMemoryRateLimiter(
+    requests_per_second=0.2,   # 1 request every 5 seconds = 12 RPM
+    check_every_n_seconds=0.1,
+    max_bucket_size=1
+)
+
+# 2. Judge LLM: Gemini 3.5 Flash-Lite with rate limiting and retry backoff
+evaluator_chat = ChatGoogleGenAI(
+    model="gemini-3.5-flash-lite",
+    temperature=0.0,
+    rate_limiter=rate_limiter,
+    max_retries=5,
+)
+evaluator_llm = LangchainLLMWrapper(evaluator_chat)
+
+# 3. Embeddings: Voyage AI wrapper
+evaluator_embeddings = LangchainEmbeddingsWrapper(
+    VoyageAIEmbeddings(model="voyage-4-large")
+)
+
+# 4. Ragas RunConfig: Sequential execution with retry safety
+run_config = RunConfig(
+    max_workers=1,        # Strictly sequential to prevent concurrency bursts
+    timeout=60,
+    max_retries=5,
+    max_wait=60
 )
 
 result = evaluate(
@@ -741,8 +817,9 @@ result = evaluate(
         ResponseRelevancy(),
         AnswerCorrectness(),
     ],
-    llm=gemini_flash_lite_wrapper,
-    embeddings=voyage_finance_2_wrapper,
+    llm=evaluator_llm,
+    embeddings=evaluator_embeddings,
+    run_config=run_config,
 )
 ```
 
@@ -767,18 +844,22 @@ Results are written to `evaluation/ablation_results.json`.
 
 ```
 POST  /ingest
+      Rate Limit: 3 requests/minute per API key (SlowAPI via Redis)
       Body: { file: <binary PDF>, company_name: str, fiscal_year: int, filing_type: str }
       Response: { document_id: str, status: "queued" }
 
 GET   /ingest/{document_id}/status
+      Rate Limit: 60 requests/minute
       Response: { document_id: str, status: str, chunks_indexed: int }
 
 POST  /query
+      Rate Limit: 10 requests/minute per API key (SlowAPI via Redis)
       Body: { question: str, filters?: { company_name?, fiscal_year?, filing_type? } }
       Response: AnswerSchema
 
 POST  /evaluate
-      Body: { qa_pairs?: list, use_golden_dataset?: bool }
+      Rate Limit: 1 request/hour per API key (Admin protected)
+      Body: { mode?: "smoke" | "full", qa_pairs?: list }
       Response: { scores: RAGASScoreReport }
 
 GET   /health
@@ -787,15 +868,45 @@ GET   /health
 
 ### 16.2 Request Handling Architecture
 
-- Ingestion requests (`POST /ingest`) are **async background tasks** — the endpoint returns immediately with a `document_id` and the parsing/indexing pipeline runs in the background. Job progress is tracked in Upstash Redis via `HSET task:{task_id}` entries.
-- Query requests (`POST /query`) run synchronously within a 30-second timeout; all internal async calls (Qdrant Cloud, Neo4j AuraDB, Voyage AI, Gemini) use `asyncio.gather()` for parallelism where possible
-- **Upstash Redis** caches query results for 1 hour keyed by `SHA256(question + filters)` — repeated identical queries are served from cache at near-zero cost and < 15ms latency
+- Ingestion requests (`POST /ingest`) are **async background tasks** — the endpoint returns immediately with a `document_id` and the parsing/indexing pipeline runs in the background. Active jobs are bounded by `MAX_CONCURRENT_INGESTIONS=3` tracked in Upstash Redis via `HSET task:{task_id}`.
+- Query requests (`POST /query`) run synchronously within a 30-second timeout; all internal async calls (Qdrant Cloud, Neo4j AuraDB, Voyage AI, Gemini) use `asyncio.gather()` for parallelism where possible.
+- **Upstash Redis** caches query results for 1 hour keyed by `SHA256(question + filters)` — repeated identical queries are served from cache at near-zero cost and < 15ms latency, bypassing all LLM and embedding API calls entirely.
 
-### 16.3 Rate Limiting & Error Handling
+### 16.3 Multi-Tier Rate Limiting & Resilience Architecture
 
-- Rate limit the `/query` endpoint to 10 requests/minute per API key
-- Implement circuit breakers for Voyage AI API and Qdrant Cloud; degrade gracefully if cloud services are unreachable
-- All LlamaParse API calls use the async polling mode (submit job -> poll every 15s -> fetch result) to handle large documents without blocking threads
+AmorphNet enforces rate limiting at two distinct layers:
+
+```
+[Client Request]
+       |
+       v
++------------------------------------------------------------------------+
+| 1. API GATEWAY LAYER (SlowAPI + Upstash Redis)                         |
+|    • /query:    10 req/min per key                                     |
+|    • /ingest:   3 req/min per key (queue capped at 3 concurrent jobs)  |
+|    • /evaluate: 1 req/hour per key (admin only)                        |
++------------------------------------------------------------------------+
+       |
+       v
++------------------------------------------------------------------------+
+| 2. BACKEND OUTBOUND CLIENT LAYER (aiolimiter + tenacity)               |
+|    • Gemini API:    aiolimiter (14 RPM Free / 1000 RPM PAYG) + retries |
+|    • Voyage AI:     AsyncClient(max_retries=5) + batch size <= 128     |
+|    • LlamaParse:    asyncio.Semaphore(3) + 15s async job polling       |
+|    • Qdrant Cloud:  batch size 100 + concurrency cap 5                 |
++------------------------------------------------------------------------+
+```
+
+1. **API Inbound Throttling (`slowapi`)**:
+   - Implemented via `slowapi.Limiter(key_func=get_api_key_or_ip, storage=RedisStorage(redis_client))` connecting directly to Upstash Redis. Rate limit state persists across serverless/container reboots and horizontally scaled app instances.
+   - Throws standard HTTP `429 Too Many Requests` with `Retry-After` header when clients exceed limits.
+
+2. **Backend Outbound Protection**:
+   - **Google GenAI (Gemini 3.5 Flash-Lite)**: Token-bucket `AsyncLimiter` shared across QueryAnalysis, generation, and metadata enrichment, paired with `tenacity` exponential retry backoff on `RESOURCE_EXHAUSTED` (HTTP 429).
+   - **Voyage AI (`voyage-4-large` & `rerank-2.5`)**: Automatic retry backoff (`max_retries=5`) on HTTP 429. Embedding requests are batched to 128 items per call; offline backfills leverage Voyage Batch API.
+   - **LlamaParse API**: Bounded by an `asyncio.Semaphore(3)` and utilizes async job polling every 15 seconds, preventing exceeding the 5 concurrent parse limit on Starter/Free tiers.
+   - **Circuit Breakers**: Circuit breakers wrap Voyage AI and Qdrant Cloud; if either service is degraded, the API falls back to cached responses or returns clean structured errors without cascading service hangs.
+
 
 ---
 
@@ -977,11 +1088,17 @@ UPSTASH_REDIS_REST_TOKEN=...
 # Standard redis-py compatible URL (also supported):
 # REDIS_URL=rediss://default:<token>@<your-db>.upstash.io:6379
 
-# Application
+# Application & Concurrency
 LOG_LEVEL=INFO
 MAX_CONCURRENT_INGESTIONS=3
 QUERY_TIMEOUT_SECONDS=30
 CACHE_TTL_SECONDS=3600
+
+# Rate Limiting & Quota Controls
+LLAMAPARSE_MAX_CONCURRENCY=3
+VOYAGE_MAX_RETRIES=5
+GEMINI_RPM_LIMIT=14          # 14 for Free Tier; set to 500-1000 for Pay-As-You-Go Tier 1+
+EVAL_MODE=smoke              # "smoke" (10 questions, ~50 LLM calls) or "full" (100 questions)
 ```
 
 Secrets are **never** committed to version control. Use a `.env` file locally (gitignored) and environment variable injection on your deployment platform (Render, Railway, Google Cloud Run, etc.). A secrets manager like HashiCorp Vault or Doppler is recommended for production.
@@ -1012,9 +1129,12 @@ Qdrant's native hybrid Query API (dense + sparse in a single call with server-si
 
 Vector search is fundamentally a nearest-neighbor problem — it cannot answer "give me the section two levels up from this chunk" or "give me the chunk that Note 7 cross-references". The knowledge graph enables structural and relational retrieval that vector search cannot provide. Together, they form a **hybrid retrieval architecture** that covers both semantic similarity and document structure.
 
-### Why voyage-finance-2 over general-purpose embeddings?
+### Why voyage-4-large over legacy voyage-finance-2 and general embeddings?
 
-Domain-specific embeddings consistently outperform general embeddings on in-domain retrieval tasks. `voyage-finance-2` was trained on financial corpora and understands the semantic relationships between financial terms. For example, it knows that "net revenue", "total sales", "top line", and "revenue" are semantically related in a financial context, whereas `text-embedding-3-large` may not capture these domain-specific synonymies as well.
+Voyage AI's latest Series 4 generation represents a major architectural leap that supersedes previous domain-specific models:
+1. **Superior Benchmarks (RTEB #1)**: Voyage AI's official documentation and Retrieval Embedding Benchmark (RTEB) evaluations show that the Series 4 family (`voyage-4-large`) is "strictly better than legacy models in all aspects, such as quality, context length, latency, and throughput", consistently outperforming previous specialized models like `voyage-finance-2` as well as OpenAI `text-embedding-3-large` and Cohere `embed-v4` across financial disclosures, SEC filings, and complex tabular retrieval.
+2. **Mixture-of-Experts (MoE) Architecture**: `voyage-4-large` is the first production embedding model built on an MoE foundation. It achieves state-of-the-art accuracy with a 75% reduction in active parameters and 40% lower serving costs compared to dense models of comparable capability.
+3. **Full 32k Context & Shared Embedding Space**: Offers a native 32,000-token context window with Matryoshka Representation Learning (MRL) supporting default 1024-dimension embeddings (ideal for Qdrant HNSW indexing). Additionally, the shared embedding space allows future asymmetric optimization (e.g., querying with `voyage-4-lite`) without re-indexing corpus chunks.
 
 ### Why temperature 0.1 for generation?
 
