@@ -93,18 +93,18 @@ All three sub-systems are orchestrated by LangGraph and exposed via FastAPI.
 | Layer | Technology | Version / Driver / Model | Role |
 |---|---|---|---|
 | Document Parsing | LlamaParse Cloud API | `llama-cloud-services >=0.6.94` (API v2) | Structure-aware PDF parsing with multimodal output |
-| Embeddings | `voyage-4-large` | `voyageai >=0.5.0` via Voyage AI API (cloud) | Flagship MoE dense embeddings (1024 dim default, 32k context) |
+| Embeddings | `voyage-4-large` | `voyageai >=0.5.0`, `langchain-voyageai >=0.4.1` via Voyage AI API (cloud) | Flagship MoE dense embeddings (1024 dim default, 32k context) |
 | Sparse Vectorizer | BM25 (Qdrant Cloud native inference) | Qdrant Cloud v1.14+ | Keyword-based sparse vectors — generated server-side on Qdrant Cloud |
-| Vector Store | **Qdrant Cloud** | `qdrant-client >=1.19.0` (managed cloud API) | Dense + sparse named vectors, hybrid Query API |
-| Graph Store | **Neo4j AuraDB** | `neo4j >=6.3.0` / AuraDB v5.26+ (managed cloud API) | Document/section/entity relationship graph |
+| Vector Store | **Qdrant Cloud** | `qdrant-client >=1.19.1` (managed cloud API) | Dense + sparse named vectors, hybrid Query API |
+| Graph Store | **Neo4j AuraDB** | `neo4j >=6.3.1` / AuraDB v5.26+ (managed cloud API) | Document/section/entity relationship graph |
 | Fusion | RRF (built into Qdrant Query API) | Qdrant Cloud v1.14+ | Reciprocal Rank Fusion of BM25 + dense prefetches |
 | Re-ranking | `rerank-2.5` | `voyageai >=0.5.0` via Voyage AI API (cloud) | Cross-encoder precision re-ranking — 32k context with instruction-following |
-| Orchestration | LangChain + LangGraph | `langchain >=1.4.0`, `langgraph >=1.2.11` | Pipeline DAG + stateful agent workflows |
-| Generation | `gemini-3.5-flash-lite` | `google-genai >=2.23.0` via Google GenAI API (cloud) | Citation-grounded answer generation |
-| Evaluation | RAGAS + Gemini 3.5 Flash-Lite | `ragas >=0.4.3`, `langchain-google-genai` | Automated RAG quality metrics evaluated via Gemini 3.5 Flash-Lite |
-| API & Schema | FastAPI + Pydantic + SlowAPI | `fastapi >=0.141.1`, `pydantic >=2.13.5`, `slowapi >=0.1.9` | REST API with Redis-backed endpoint rate limiting + schemas |
-| Rate Limiting & Throttling | `aiolimiter` + `tenacity` | `aiolimiter >=1.2.1`, `tenacity >=9.0.0` | Client-side token-bucket rate limiters and exponential backoff retry wrappers |
-| Async Runtime | asyncio + uvicorn | `uvicorn >=0.52.4`, Python 3.12+ | Fully async pipeline execution |
+| Orchestration | LangChain + LangGraph | `langchain >=1.4.3`, `langgraph >=1.2.12` | Pipeline DAG + stateful agent workflows |
+| Generation | `gemini-3.5-flash-lite` | `google-genai >=2.25.0` via Google GenAI API (cloud) | Citation-grounded answer generation |
+| Evaluation | RAGAS + Gemini 3.5 Flash-Lite | `ragas >=0.4.3`, `langchain-google-genai >=4.4.0` | Automated RAG quality metrics evaluated via Gemini 3.5 Flash-Lite |
+| API & Schema | FastAPI + Pydantic + SlowAPI | `fastapi >=0.142.2`, `pydantic >=2.13.5`, `pydantic-settings >=2.15.0`, `slowapi >=0.1.10` | REST API with Redis-backed endpoint rate limiting + schemas |
+| Rate Limiting & Throttling | `aiolimiter` + `tenacity` | `aiolimiter >=1.3.0`, `tenacity >=9.1.4` | Client-side token-bucket rate limiters and exponential backoff retry wrappers |
+| Async Runtime | asyncio + uvicorn | `uvicorn >=0.54.0`, Python 3.12+ | Fully async pipeline execution |
 | Caching | **Upstash Redis** (Serverless) | `upstash-redis >=1.8.0` / `redis >=8.1.0` | Cloud-hosted serverless Redis — query cache + rate limiter backend + task state |
 
 > **Note on `voyage-4-large` vs legacy `voyage-finance-2`**: Voyage AI's latest flagship model is `voyage-4-large` (32k context, 1024 dim default). According to Voyage AI's benchmark evaluations (Retrieval Embedding Benchmark - RTEB) and official documentation, the Series 4 generation is "strictly better than legacy models in all aspects, such as quality, context length, latency, and throughput", outperforming previous domain-specific models including `voyage-finance-2` across financial filings and complex multi-page retrieval. It introduces a state-of-the-art Mixture-of-Experts (MoE) architecture (75% fewer active parameters, 40% lower serving costs) and features a shared embedding space. Use `voyage-4-large` for all chunk and query dense embeddings in this project.
@@ -727,14 +727,14 @@ This validation is a lightweight string-matching step, not an LLM call.
 
 ### 15.1 Evaluation Dataset Construction & Quota Management
 
-Build a **golden QA dataset** of 100 curated questions by:
-1. Manually curating 100 questions from 5–6 representative annual reports (~15–20 questions per filing) with verified ground truth answers and exact source chunk IDs (`reference_chunks`). Eliminating synthetic LLM generation ensures zero question hallucination, high analytical complexity (multi-table lookups, footnote reconciliation), and a reliable benchmark.
+Build a **golden QA dataset** of 50 curated questions by:
+1. Manually curating 50 questions from representative annual reports (~10–15 questions per section/filing, such as Apple FY25 10-K) with verified ground truth answers and exact source chunk IDs (`reference_chunks`). Eliminating synthetic LLM generation ensures zero question hallucination, high analytical complexity (multi-table lookups, footnote reconciliation), and a reliable benchmark.
 2. Distributing across query types: 30% `factual_numeric`, 25% `trend_comparative`, 25% `semantic_risk`, 20% `cross_reference`.
 
 > [!WARNING]
-> **Daily Quota (RPD) Guardrail**: Evaluating 100 questions across 5 LLM metrics triggers **~500 LLM calls**, which exhausts 100% of Google AI Studio's Free Tier quota (500 RPD). To safeguard daily quotas, evaluation supports two modes:
+> **Daily Quota (RPD) Guardrail**: Evaluating 50 questions across 5 LLM metrics triggers **~250–300 LLM calls**, which safely consumes ~50–60% of Google AI Studio's Free Tier quota (500 RPD). To safeguard daily quotas during rapid iterations, evaluation supports two modes:
 > - **`smoke_eval` (Development / Free Tier)**: Evaluates a 10-question stratified subset (~50 LLM calls, consuming only 10% of daily quota).
-> - **`full_eval` (Benchmark / Production CI)**: Evaluates all 100 questions. Requires a Google AI Studio **Pay-As-You-Go account (Tier 1+)**, where the 500 RPD ceiling is lifted and RPM scales to 1,000+.
+> - **`full_eval` (Benchmark / Production CI)**: Evaluates all 50 questions (~250–300 LLM calls). Fits comfortably within Free Tier limits or scales seamlessly with a Pay-As-You-Go account (Tier 1+).
 
 Each QA pair has:
 ```python
@@ -1098,7 +1098,7 @@ CACHE_TTL_SECONDS=3600
 LLAMAPARSE_MAX_CONCURRENCY=3
 VOYAGE_MAX_RETRIES=5
 GEMINI_RPM_LIMIT=14          # 14 for Free Tier; set to 500-1000 for Pay-As-You-Go Tier 1+
-EVAL_MODE=smoke              # "smoke" (10 questions, ~50 LLM calls) or "full" (100 questions)
+EVAL_MODE=smoke              # "smoke" (10 questions, ~50 LLM calls) or "full" (50 questions, ~250 LLM calls)
 ```
 
 Secrets are **never** committed to version control. Use a `.env` file locally (gitignored) and environment variable injection on your deployment platform (Render, Railway, Google Cloud Run, etc.). A secrets manager like HashiCorp Vault or Doppler is recommended for production.

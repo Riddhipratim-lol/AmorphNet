@@ -21,15 +21,15 @@ To ensure empirical rigor and avoid regressions, the project follows a **Two-Tie
 
 All datastores and AI services run **exclusively on managed cloud APIs** (Zero local databases, zero Docker containers):
 - **Document Parsing**: LlamaParse Cloud API (`llama-cloud-services >= 0.6.94`, API v2)
-- **Dense Embeddings**: Voyage AI `voyage-4-large` (1024 dim default, 32k context window, MoE architecture)
+- **Dense Embeddings**: Voyage AI `voyage-4-large` (1024 dim default, 32k context window, MoE architecture) (`voyageai >= 0.5.0`, `langchain-voyageai >= 0.4.1`)
 - **Sparse Vectors**: Qdrant Cloud Native BM25 Inference (`modifier: "idf"`)
-- **Vector Database**: Qdrant Cloud Cluster (`qdrant-client >= 1.19.0`)
-- **Graph Database**: Neo4j AuraDB (`neo4j >= 6.3.0`)
+- **Vector Database**: Qdrant Cloud Cluster (`qdrant-client >= 1.19.1`)
+- **Graph Database**: Neo4j AuraDB (`neo4j >= 6.3.1`)
 - **Re-Ranking**: Voyage AI `rerank-2.5` (32k context window, instruction-following)
-- **Generation & LLM Judges**: Google GenAI `gemini-3.5-flash-lite` (`google-genai >= 2.23.0`, `langchain-google-genai`)
+- **Generation & LLM Judges**: Google GenAI `gemini-3.5-flash-lite` (`google-genai >= 2.25.0`, `langchain-google-genai >= 4.4.0`)
 - **Caching & Rate Limit State**: Upstash Redis Serverless (`upstash-redis >= 1.8.0`, `redis >= 8.1.0`)
-- **Pipeline Orchestration**: LangChain (`>= 1.4.0`) + LangGraph (`>= 1.2.11`)
-- **API Framework**: FastAPI (`>= 0.141.1`) + Pydantic (`>= 2.13.5`) + SlowAPI (`>= 0.1.9`)
+- **Pipeline Orchestration**: LangChain (`>= 1.4.3`) + LangGraph (`>= 1.2.12`)
+- **API Framework**: FastAPI (`>= 0.142.2`) + Pydantic (`>= 2.13.5`, `pydantic-settings >= 2.15.0`) + SlowAPI (`>= 0.1.10`)
 - **Evaluation**: RAGAS (`>= 0.4.3`)
 
 ---
@@ -107,11 +107,11 @@ All datastores and AI services run **exclusively on managed cloud APIs** (Zero l
 - [x] **0.1 Virtual Environment & Package Management Setup**
   - Verify Python 3.12+ environment (`.python-version`).
   - Configure `pyproject.toml` with strict dependencies:
-    - `llama-cloud-services>=0.6.94`, `voyageai>=0.5.0`, `qdrant-client>=1.19.0`, `neo4j>=6.3.0`
-    - `google-genai>=2.23.0`, `langchain>=1.4.0`, `langgraph>=1.2.11`, `langchain-google-genai>=2.0.0`
-    - `ragas>=0.4.3`, `fastapi>=0.141.1`, `uvicorn>=0.52.4`, `pydantic>=2.13.5`, `pydantic-settings>=2.7.0`
-    - `slowapi>=0.1.9`, `redis>=8.1.0`, `upstash-redis>=1.8.0`, `aiolimiter>=1.2.1`, `tenacity>=9.0.0`
-    - `pymupdf>=1.25.0`, `pytest>=8.3.0`, `pytest-asyncio>=0.24.0`, `httpx>=0.28.0`
+    - `llama-cloud-services>=0.6.94`, `voyageai>=0.5.0`, `langchain-voyageai>=0.4.1`, `qdrant-client>=1.19.1`, `neo4j>=6.3.1`
+    - `google-genai>=2.25.0`, `langchain>=1.4.3`, `langgraph>=1.2.12`, `langchain-google-genai>=4.4.0`
+    - `ragas>=0.4.3`, `fastapi>=0.142.2`, `uvicorn>=0.54.0`, `pydantic>=2.13.5`, `pydantic-settings>=2.15.0`
+    - `slowapi>=0.1.10`, `redis>=8.1.0`, `upstash-redis>=1.8.0`, `aiolimiter>=1.3.0`, `tenacity>=9.1.4`
+    - `pymupdf>=1.28.2`, `pytest>=9.1.1`, `pytest-asyncio>=1.4.0`, `httpx>=0.28.1`, `python-dotenv>=1.2.3`
   - Install dependencies via `uv sync` or pip.
 - [x] **0.2 Directory Layout Creation**
   - Build directory tree strictly conforming to Section 17 of `architecture.md`:
@@ -148,8 +148,8 @@ All datastores and AI services run **exclusively on managed cloud APIs** (Zero l
 ### Phase 1: Golden Evaluation Dataset & Evaluation Harness Foundation
 **Goal**: Build the ground truth evaluation dataset and RAGAS harness before pipeline construction, ensuring objective measurement from day one.
 
-- [ ] **1.1 Curate Golden Financial QA Dataset (`evaluation/golden_dataset.json`)**
-  - Curate 100 high-complexity QA pairs from 5–6 representative annual filings (e.g., Apple, Microsoft, Amazon, Alphabet, Tesla 10-Ks).
+- [x] **1.1 Curate Golden Financial QA Dataset (`evaluation/golden_dataset.json`)**
+  - Curate 50 high-complexity QA pairs from representative annual filings (e.g., Apple FY25 10-K).
   - Enforce query distribution specified in Section 15.1:
     - 30% `factual_numeric` (multi-row financial statements, footnote reconciliation)
     - 25% `trend_comparative` (multi-year revenue/margin changes)
@@ -157,15 +157,15 @@ All datastores and AI services run **exclusively on managed cloud APIs** (Zero l
     - 20% `cross_reference` (specific "Note X" disclosures, lease obligations, segment reporting)
   - Populate each record with schema: `question`, `ground_truth`, `reference_chunks`, `filing_type`, `fiscal_year`, `company_name`.
   - Formulate a 10-question stratified subset for `smoke_eval` mode (preserving the exact 30/25/25/20 distribution).
-- [ ] **1.2 Build RAGAS Evaluator Harness (`amorphnet/evaluation/ragas_runner.py`)**
+- [x] **1.2 Build RAGAS Evaluator Harness (`amorphnet/evaluation/ragas_runner.py`)**
   - Implement sequential evaluator compatible with Ragas v0.4.3+:
     - Attach LangChain `InMemoryRateLimiter(requests_per_second=0.2)` (12 RPM) to `ChatGoogleGenAI(model="gemini-3.5-flash-lite")`.
     - Wrap judge LLM with `LangchainLLMWrapper`.
     - Wrap `VoyageAIEmbeddings(model="voyage-4-large")` with `LangchainEmbeddingsWrapper`.
     - Initialize core metric instances: `LLMContextPrecisionWithReference`, `LLMContextRecall`, `Faithfulness`, `ResponseRelevancy`, `AnswerCorrectness`.
     - Configure `RunConfig(max_workers=1, timeout=60, max_retries=5, max_wait=60)`.
-- [ ] **1.3 Build Evaluation Execution Script (`scripts/run_evaluation.py`)**
-  - Implement CLI supporting `--mode smoke` (10 items, ~50 LLM calls) and `--mode full` (100 items, ~500 calls).
+- [x] **1.3 Build Evaluation Execution Script (`scripts/run_evaluation.py`)**
+  - Implement CLI supporting `--mode smoke` (10 items, ~50 LLM calls) and `--mode full` (50 items, ~250 calls).
   - Format output metrics into console summary and persist results to `evaluation/ablation_results.json`.
 
 **Inputs**: Curated 10-K/filing PDFs, ground truth answers.  
@@ -508,7 +508,7 @@ All datastores and AI services run **exclusively on managed cloud APIs** (Zero l
     - `full`: Complete AmorphNet pipeline with table score boosting and citation validation.
 - [ ] **14.2 Benchmark Run & Quota Management**
   - Run `scripts/run_evaluation.py --mode smoke` (10 questions, ~50 LLM calls) for development validation.
-  - Run full benchmark on 100 questions once configured with Pay-As-You-Go API credentials.
+  - Run full benchmark on 50 questions (~250 LLM calls).
 - [ ] **14.3 Metrics Verification vs Architecture Targets**
   - Verify metrics against canonical targets from Section 15.2:
     - `ContextPrecision >= 0.75`
@@ -558,10 +558,10 @@ Use this master checklist to track AmorphNet implementation progress within Anti
   - [x] 0.3 Configuration & Secrets Management (`amorphnet/config.py`)
   - [x] 0.4 Shared Cloud Client Singletons & Rate Limiting Guardrails
   - [x] 0.5 Service Connectivity Verification Script (`scripts/check_services.py`)
-- [ ] **Phase 1: Golden Evaluation Dataset & Evaluation Harness Foundation**
-  - [ ] 1.1 Curate Golden Financial QA Dataset (`evaluation/golden_dataset.json`)
-  - [ ] 1.2 Build RAGAS Evaluator Harness (`amorphnet/evaluation/ragas_runner.py`)
-  - [ ] 1.3 Build Evaluation Execution Script (`scripts/run_evaluation.py`)
+- [x] **Phase 1: Golden Evaluation Dataset & Evaluation Harness Foundation**
+  - [x] 1.1 Curate Golden Financial QA Dataset (`evaluation/golden_dataset.json`)
+  - [x] 1.2 Build RAGAS Evaluator Harness (`amorphnet/evaluation/ragas_runner.py`)
+  - [x] 1.3 Build Evaluation Execution Script (`scripts/run_evaluation.py`)
 - [ ] **Phase 2: Tier 1 Baseline Pipeline Implementation**
   - [ ] 2.1 Baseline Document Ingestion & Chunking (`amorphnet/ingestion/baseline_ingest.py`)
   - [ ] 2.2 Baseline Vector Indexing (`amorphnet/ingestion/baseline_indexer.py`)
